@@ -1,0 +1,59 @@
+# Zabbix SLA Report Configuration
+
+zabbix:
+  url: "zabbixurl"
+  token: "TOKEN for API"
+
+# Default SLA settings (used if group doesn't have its own)
+default_sla_threshold: 99.9
+default_orange_threshold: 5.0
+
+# Report generation mode:
+# - "combined": All groups in one Excel file with separate sheets (default)
+# - "separate": Each group gets its own Excel file
+report_mode: "separate"
+
+# Host groups configuration
+# Each group can have its own SLA threshold, or use the default
+# Format:
+#   group_name:
+#     sla_threshold: 99.99  (optional, uses default if not specified)
+#     orange_threshold: 5.0  (optional, uses default if not specified)
+#     excluded_hosts: []     (optional, hosts to exclude for this group only)
+
+host_groups:
+  host_group1:
+    sla_threshold: 99.99
+    orange_threshold: 5.0
+    excluded_hosts: []
+      # - "test-device-1"
+
+  # Example additional groups - uncomment and configure as needed:
+  #
+  # "Linux servers":
+  #   sla_threshold: 99.9
+  #   orange_threshold: 5.0
+  #
+  # "Windows servers":
+  #   sla_threshold: 99.5
+  #   orange_threshold: 5.0
+  #
+  # "Network devices":
+  #   sla_threshold: 99.99
+  #   orange_threshold: 3.0
+  #
+  # "Critical Infrastructure":
+  #   sla_threshold: 99.999
+  #   orange_threshold: 2.0
+
+# Global excluded hosts (excluded from ALL groups)
+global_excluded_hosts:
+  # - "test-server-01"
+  # - "maintenance-device"
+
+# Output settings
+output:
+  filename_prefix: "SLA_Report"
+  include_timestamp: true
+  # Output directory (optional, defaults to current directory)
+  # output_dir: "/path/to/reports"
