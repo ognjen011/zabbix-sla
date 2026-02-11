@@ -110,36 +110,83 @@ class ZabbixAPI:
         self, host_id: str, time_from: int, time_till: int
     ) -> dict:
         """
-        Calculate host availability based on problem records.
+        Calculate host availability based on event records.
         Returns availability percentage.
-        Only counts 'Unavailable by ICMP ping' High severity problems.
+        Only counts 'Unavailable by ICMP ping' problems.
+
+        Uses event.get (not problem.get) because the problem table may not
+        retain resolved problems depending on housekeeper/recent settings.
+        Two-step: fetch PROBLEM events, then batch-fetch recovery events.
         """
-        # Use problem.get which has recovery time information
-        # Include 'name' to filter by trigger name
+        # Step 1: Get PROBLEM events (value=1) within the time window
         params = {
-            "output": ["eventid", "clock", "r_clock", "r_eventid", "name"],
+            "output": ["eventid", "clock", "r_eventid", "name"],
             "hostids": [host_id],
             "time_from": time_from,
             "time_till": time_till,
-            "severities": [4],  # High severity only
-            "sortfield": "eventid",
+            "source": 0,   # Triggers
+            "object": 0,   # Trigger events
+            "value": "1",  # PROBLEM events only
+            "sortfield": ["clock"],
             "sortorder": "ASC",
         }
-        problems = self._call("problem.get", params)
+        events_in_window = self._call("event.get", params)
 
+        # Step 2: Get PROBLEM events that started BEFORE the window
+        # (they may still have been active during the window)
+        params_before = {
+            "output": ["eventid", "clock", "r_eventid", "name"],
+            "hostids": [host_id],
+            "time_till": time_from - 1,
+            "source": 0,
+            "object": 0,
+            "value": "1",
+            "sortfield": ["clock"],
+            "sortorder": "DESC",
+            "limit": 50,
+        }
+        events_before = self._call("event.get", params_before)
+
+        # Combine all candidate events
+        all_events = list(events_in_window) + list(events_before)
+
+        # Step 3: Collect all recovery event IDs so we can batch-fetch their timestamps
+        recovery_ids = []
+        for evt in all_events:
+            r_id = evt.get("r_eventid", "0")
+            if r_id and r_id != "0":
+                recovery_ids.append(r_id)
+
+        # Step 4: Batch-fetch recovery events to get their clock (= recovery time)
+        recovery_map = {}  # r_eventid -> clock
+        if recovery_ids:
+            recovery_params = {
+                "output": ["eventid", "clock"],
+                "eventids": recovery_ids,
+            }
+            recovery_events = self._call("event.get", recovery_params)
+            for rev in recovery_events:
+                recovery_map[rev["eventid"]] = int(rev["clock"])
+
+        # Step 5: Calculate downtime
         total_seconds = time_till - time_from
         downtime_seconds = 0
 
-        for problem in problems:
+        for event in all_events:
             # Only count "Unavailable by ICMP ping" problems
-            problem_name = problem.get("name", "").lower()
-            if "unavailable by icmp" not in problem_name and "icmp ping" not in problem_name:
+            event_name = event.get("name", "").lower()
+            if "unavailable by icmp" not in event_name:
                 continue
 
-            event_start = int(problem["clock"])
-            # r_clock is 0 if problem is still active
-            r_clock = problem.get("r_clock", "0")
-            event_end = int(r_clock) if r_clock and r_clock != "0" else time_till
+            event_start = int(event["clock"])
+            r_eventid = event.get("r_eventid", "0")
+
+            if r_eventid and r_eventid != "0":
+                # Resolved: look up recovery time
+                event_end = recovery_map.get(r_eventid, time_till)
+            else:
+                # Still active / unresolved
+                event_end = time_till
 
             # Clamp to the time range
             actual_start = max(event_start, time_from)
