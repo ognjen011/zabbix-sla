@@ -770,20 +770,23 @@ elif page == "Report History":
                         )
 
                     # View detail
-                    if st.button("View Details", key=f"hist_view_{rpt['id']}"):
-                        full_report = db.get_report(rpt["id"])
-                        if full_report and full_report.get("detail_data"):
-                            for gn, hlist in full_report["detail_data"].items():
-                                st.markdown(f"**{gn}**")
-                                if hlist:
-                                    hdf = pd.DataFrame(hlist)
-                                    st.dataframe(hdf, use_container_width=True, hide_index=True)
+                    view_details = st.button("View Details", key=f"hist_view_{rpt['id']}")
 
                     # Delete (admin only)
                     if is_admin():
                         if st.button("Delete", key=f"hist_del_{rpt['id']}", type="secondary"):
                             db.delete_report(rpt["id"])
                             st.rerun()
+
+                # Render detail tables at full width (outside columns)
+                if view_details:
+                    full_report = db.get_report(rpt["id"])
+                    if full_report and full_report.get("detail_data"):
+                        for gn, hlist in full_report["detail_data"].items():
+                            st.markdown(f"**{gn}**")
+                            if hlist:
+                                hdf = pd.DataFrame(hlist)
+                                st.dataframe(hdf, use_container_width=True, hide_index=True)
 
 
 # ============================================================
