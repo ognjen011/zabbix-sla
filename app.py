@@ -14,15 +14,20 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import yaml
+
+from retained_trends import combine_retained_trends
+from report_visuals import show_sla_gauges, show_link_trends, show_sla_trends
+from sla_trends import collect_sla_history, group_sla_history
+from link_usage import collect_link_report, usage_rows, add_usage_sheet, validate_config
+
+from browser_auth import set_login, clear_login, restore_login
 
 import database as db
-from zabbix_sla_report import DateRangeCalculator, ExcelReportGenerator, ZabbixAPI
+from zabbix_sla_report import DateRangeCalculator, ExcelReportGenerator, ZabbixAPI, load_config
 
 # --- Page config (must be first Streamlit call) ---
 st.set_page_config(
     page_title="Zabbix Reporter",
-    page_icon=":bar_chart:",
     layout="wide",
     menu_items={
         "Get Help": None,
@@ -38,8 +43,7 @@ db.init_db()
 CONFIG_PATH = Path("config.yaml")
 default_config = {}
 if CONFIG_PATH.exists():
-    with open(CONFIG_PATH) as f:
-        default_config = yaml.safe_load(f) or {}
+    default_config = load_config(CONFIG_PATH)
 
 
 # ============================================================
@@ -59,9 +63,7 @@ def is_admin() -> bool:
 
 
 def logout():
-    for key in ["authenticated", "user"]:
-        st.session_state.pop(key, None)
-    st.rerun()
+    clear_login()
 
 
 def show_login_page():
@@ -81,13 +83,7 @@ def show_login_page():
                 return
             user = db.authenticate(username, password)
             if user:
-                st.session_state["authenticated"] = True
-                st.session_state["user"] = {
-                    "id": user["id"],
-                    "username": user["username"],
-                    "role": user["role"],
-                    "display_name": user["display_name"],
-                }
+                set_login(user, default_config)
                 st.rerun()
             else:
                 st.error("Invalid username or password.")
@@ -177,6 +173,7 @@ def build_excel_bytes(all_group_data, all_group_summaries, selected_groups, sla_
             report.sla_threshold = grp_sla
             report.orange_threshold = grp_orange
             report.create_sheet(group_name, host_list, grp_sla)
+            add_usage_sheet(report, group_name, host_list)
         report.add_summary_sheet(all_group_summaries)
         buf = io.BytesIO()
         report.workbook.save(buf)
@@ -190,6 +187,7 @@ def build_excel_bytes(all_group_data, all_group_summaries, selected_groups, sla_
             grp_orange = gc.get("orange_threshold", orange_threshold)
             report = ExcelReportGenerator(grp_sla, grp_orange)
             report.create_sheet(group_name, host_list, grp_sla)
+            add_usage_sheet(report, group_name, host_list)
             summary_for_group = [s for s in all_group_summaries if s["group_name"] == group_name]
             report.add_summary_sheet(summary_for_group)
             buf = io.BytesIO()
@@ -200,9 +198,31 @@ def build_excel_bytes(all_group_data, all_group_summaries, selected_groups, sla_
     return results
 
 
+def save_report_file(report_data, filename, excel_bytes):
+    """Persist only the groups included in this Excel file."""
+    groups = report_data.get("file_groups", {}).get(filename, list(report_data["all_group_data"]))
+    summaries = [summary for summary in report_data["all_group_summaries"] if summary["group_name"] in groups]
+    return db.save_report(
+        generated_by=current_user()["username"], report_name=filename,
+        period=report_data["period"], groups_list=groups,
+        host_count=sum(summary["total"] for summary in summaries), summary_data=summaries,
+        detail_data={group: report_data["detail_for_storage"][group] for group in groups},
+        excel_data=excel_bytes,
+    )
+
+
 # ============================================================
 # Login gate
 # ============================================================
+
+try:
+    login_ready = restore_login(default_config)
+except ValueError as exc:
+    st.error(f"Invalid authentication configuration: {exc}")
+    st.stop()
+if not login_ready:
+    st.info("Checking your saved login…")
+    st.stop()
 
 if not is_logged_in():
     show_login_page()
@@ -243,7 +263,8 @@ with st.sidebar:
                 try:
                     api = ZabbixAPI(zabbix_url, zabbix_token)
                     ver = api._call("apiinfo.version", use_auth=False)
-                    st.success(f"Connected to Zabbix API v{ver}")
+                    api._call("hostgroup.get", {"output": ["groupid"], "limit": 1})
+                    st.success(f"Connected and authenticated to Zabbix API v{ver}")
                 except Exception as e:
                     st.error(f"Connection failed: {e}")
 
@@ -256,7 +277,9 @@ with st.sidebar:
 
 if page == "Generate Report":
 
-    st.title("Generate SLA Report")
+    st.title("Generate SLA & Usage Report")
+    trend_months = default_config.get("link_usage", {}).get("history_months", 3)
+    st.info(f"Trend window: last {trend_months} complete calendar months. New reports include SLA gauges, traffic trends, peak usage, and capacity/demand growth. Set link_usage.history_months in config.yaml to 3, 6, or 12, then generate a new report.")
 
     # --- SLA settings ---
     default_sla = default_config.get("default_sla_threshold", 99.9)
@@ -266,14 +289,14 @@ if page == "Generate Report":
     with col_sla1:
         sla_threshold = st.number_input(
             "SLA Threshold (%)",
-            value=default_sla, min_value=0.0, max_value=100.0, step=0.01, format="%.2f",
+            value=float(default_sla), min_value=0.0, max_value=100.0, step=0.01, format="%.2f",
             disabled=not is_admin(),
             help="Only admins can change SLA thresholds" if not is_admin() else None,
         )
     with col_sla2:
         orange_threshold = st.number_input(
             "Warning Threshold (%)",
-            value=default_orange, min_value=0.0, max_value=100.0, step=0.1, format="%.1f",
+            value=float(default_orange), min_value=0.0, max_value=100.0, step=0.1, format="%.1f",
             disabled=not is_admin(),
             help="Only admins can change thresholds" if not is_admin() else None,
         )
@@ -368,13 +391,13 @@ if page == "Generate Report":
                     st.markdown(f"**{g}**")
                 with c2:
                     selected_groups[g]["sla_threshold"] = st.number_input(
-                        f"SLA % ({g})", value=selected_groups[g]["sla_threshold"],
+                        f"SLA % ({g})", value=float(selected_groups[g]["sla_threshold"]),
                         min_value=0.0, max_value=100.0, step=0.01, format="%.2f",
                         key=f"sla_{g}", label_visibility="collapsed",
                     )
                 with c3:
                     selected_groups[g]["orange_threshold"] = st.number_input(
-                        f"Warn % ({g})", value=selected_groups[g]["orange_threshold"],
+                        f"Warn % ({g})", value=float(selected_groups[g]["orange_threshold"]),
                         min_value=0.0, max_value=100.0, step=0.1, format="%.1f",
                         key=f"orange_{g}", label_visibility="collapsed",
                     )
@@ -405,16 +428,26 @@ if page == "Generate Report":
         try:
             api = ZabbixAPI(zabbix_url, zabbix_token)
             api._call("apiinfo.version", use_auth=False)
+            api._call("hostgroup.get", {"output": ["groupid"], "limit": 1})
         except Exception as e:
             st.error(f"Cannot connect to Zabbix: {e}")
             st.stop()
 
+        try:
+            validate_config(default_config)
+        except (ValueError, TypeError) as exc:
+            st.error(f"Invalid link usage configuration: {exc}")
+            st.stop()
         date_calc = DateRangeCalculator()
         availability_periods = date_calc.get_availability_periods()
         global_excluded_lower = [h.lower() for h in global_excluded]
 
         group_names_list = list(selected_groups.keys())
-        groups = api.get_host_groups(group_names_list)
+        try:
+            groups = api.get_host_groups(group_names_list)
+        except Exception as exc:
+            st.error(f"Cannot fetch host groups: {exc}. Check the API token in Zabbix Connection.")
+            st.stop()
 
         if not groups:
             st.error(f"No matching host groups found in Zabbix: {group_names_list}")
@@ -506,7 +539,27 @@ if page == "Generate Report":
                     summary["breach"] += 1
                 summary["total"] += 1
 
+                try:
+                    links = collect_link_report(api, host_id,
+                        int(availability_periods["prev_month"][0].timestamp()),
+                        int(availability_periods["prev_month"][1].timestamp()), default_config)
+                except Exception as exc:
+                    progress.empty()
+                    st.error(f"Cannot collect interface trends for {host_name}: {exc}")
+                    st.stop()
+                try:
+                    monthly_sla = collect_sla_history(api, host_id,
+                        int(availability_periods["prev_month"][1].timestamp()), trend_months,
+                        grp_sla, grp_orange, latest=avail_prev_month)
+                except Exception as exc:
+                    progress.empty()
+                    st.error(f"Cannot collect monthly SLA history for {host_name}: {exc}")
+                    st.stop()
                 host_data_list.append({
+                    "sla_history": monthly_sla,
+                    "link_usage": links["latest"],
+                    "link_history": links["monthly"],
+                    "link_daily": links["daily"],
                     "name": host_name,
                     "host": host_technical,
                     "avail_1_day": avail_1_day["availability"],
@@ -546,6 +599,7 @@ if page == "Generate Report":
                     "overall_prev_month": 100.0, "overall_sla": 100.0,
                 })
 
+            summary["sla_history"] = group_sla_history(host_data_list, grp_sla)
             all_group_summaries.append(summary)
             all_group_data[group_name] = host_data_list
 
@@ -563,6 +617,10 @@ if page == "Generate Report":
         detail_for_storage = {}
         for gn, hlist in all_group_data.items():
             detail_for_storage[gn] = [{
+                "sla_history": h.get("sla_history", []),
+                "link_usage": h.get("link_usage", []),
+                "link_history": h.get("link_history", []),
+                "link_daily": h.get("link_daily", []),
                 "name": h["name"], "host": h["host"],
                 "avail_1_day": h["avail_1_day"],
                 "avail_7_days": h["avail_7_days"],
@@ -578,10 +636,22 @@ if page == "Generate Report":
             "sla_threshold": sla_threshold,
             "orange_threshold": orange_threshold,
             "period": period,
+            "trend_months": trend_months,
             "excel_files": excel_files,
             "detail_for_storage": detail_for_storage,
             "total_host_count": sum(s["total"] for s in all_group_summaries),
+            "saved_ids": {},
+            "file_groups": {filename: list(all_group_data) for filename, _ in excel_files} if report_mode == "combined" else {
+                filename: [group] for (filename, _), group in zip(excel_files, [group for group, hosts in all_group_data.items() if hosts])
+            },
         }
+        if default_config.get("auto_save_reports", True):
+            report_data = st.session_state["last_report"]
+            for filename, excel_bytes in excel_files:
+                try:
+                    report_data["saved_ids"][filename] = save_report_file(report_data, filename, excel_bytes)
+                except Exception as exc:
+                    st.error(f"Report generated, but automatic saving failed: {exc}. You can download it or retry Save to history.")
 
     # --- Display results from session state ---
     rpt_data = st.session_state.get("last_report")
@@ -596,7 +666,10 @@ if page == "Generate Report":
         detail_for_storage = rpt_data["detail_for_storage"]
         total_host_count = rpt_data["total_host_count"]
 
+        st.caption(f"This report contains {rpt_data.get('trend_months', 'unknown')} months of trend history.")
         st.success(f"Report generated for {total_host_count} hosts across {len(all_group_summaries)} groups.")
+
+        show_sla_gauges(all_group_summaries, r_selected_groups, r_orange, r_period)
 
         # Summary table
         st.subheader("Summary")
@@ -671,6 +744,19 @@ if page == "Generate Report":
             )
             st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
+        st.subheader("Monthly Link Usage — Previous Calendar Month")
+        st.caption("Traffic volumes are estimates from hourly trends. Coverage shows hours with data; utilization uses historical interface speed where available, otherwise current speed. Blank values mean unavailable data.")
+        for group_name, hosts in all_group_data.items():
+            rows = usage_rows(hosts)
+            if rows:
+                st.markdown(f"**{group_name}**")
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if not any(usage_rows(hosts) for hosts in all_group_data.values()):
+            st.info("No interfaces matched the configured description regex, or link usage is disabled.")
+
+        show_sla_trends(all_group_summaries, all_group_data)
+        show_link_trends(all_group_data)
+
         # --- Excel download + save to history ---
         st.divider()
         st.subheader("Download & Save")
@@ -686,18 +772,14 @@ if page == "Generate Report":
                     key=f"dl_{filename}",
                 )
             with col_save:
-                if st.button(f"Save to history", key=f"save_{filename}"):
-                    db.save_report(
-                        generated_by=user["username"],
-                        report_name=filename,
-                        period=r_period,
-                        groups_list=list(all_group_data.keys()),
-                        host_count=total_host_count,
-                        summary_data=all_group_summaries,
-                        detail_data=detail_for_storage,
-                        excel_data=excel_bytes,
-                    )
-                    st.success("Report saved to history.")
+                if filename in rpt_data.get("saved_ids", {}):
+                    st.success(f"Retained in Report History (#{rpt_data['saved_ids'][filename]}).")
+                elif st.button("Save to history", key=f"save_{filename}"):
+                    try:
+                        rpt_data.setdefault("saved_ids", {})[filename] = save_report_file(rpt_data, filename, excel_bytes)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not save report: {exc}")
 
 
 # ============================================================
@@ -770,7 +852,8 @@ elif page == "Report History":
                         )
 
                     # View detail
-                    view_details = st.button("View Details", key=f"hist_view_{rpt['id']}")
+                    if st.button("View Details & Trends", key=f"hist_view_{rpt['id']}"):
+                        st.session_state["history_view_id"] = rpt["id"]
 
                     # Delete (admin only)
                     if is_admin():
@@ -779,14 +862,20 @@ elif page == "Report History":
                             st.rerun()
 
                 # Render detail tables at full width (outside columns)
-                if view_details:
+                if st.session_state.get("history_view_id") == rpt["id"]:
                     full_report = db.get_report(rpt["id"])
                     if full_report and full_report.get("detail_data"):
+                        trend_report = combine_retained_trends(full_report, db.get_retained_trend_data(),
+                            default_config.get("link_usage", {}).get("history_months", 3))
+                        show_sla_gauges(trend_report["summary_data"], {}, default_config.get("default_orange_threshold", 5.0), "month")
                         for gn, hlist in full_report["detail_data"].items():
                             st.markdown(f"**{gn}**")
                             if hlist:
-                                hdf = pd.DataFrame(hlist)
+                                hdf = pd.DataFrame([{k: v for k, v in host.items() if k not in ("link_usage", "link_history", "link_daily", "sla_history")} for host in hlist])
                                 st.dataframe(hdf, use_container_width=True, hide_index=True)
+                        st.caption(f"Trend charts combine retained reports for the last {trend_report['trend_months']} complete calendar months. Snapshot tables describe this report's month; gauges and trend charts show the configured history window.")
+                        show_sla_trends(trend_report["summary_data"], trend_report["detail_data"], key_prefix=f"history_{rpt['id']}_")
+                        show_link_trends(trend_report["detail_data"], key_prefix=f"history_{rpt['id']}_")
 
 
 # ============================================================

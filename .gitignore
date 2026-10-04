@@ -1,8 +1,31 @@
 venv/
+.venv/
 __pycache__/
+*.py[cod]
 
 # Database
-*.db
+*.db*
+*.sqlite*
 
 # Generated reports
 *.xlsx
+
+# Local Zabbix credential
+.zabbix-api-token
+.zabbix-api-token.*
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Generated monthly reports
+reports/
+
+# Local logs and macOS metadata
+*.log
+.DS_Store
+
+# Editor temporary files
+*.swp
+*.swo
+*~

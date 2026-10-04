@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from link_usage import collect_link_report, add_usage_sheet, validate_config
+
 import requests
 import yaml
 from openpyxl import Workbook
@@ -25,7 +27,7 @@ class ZabbixAPI:
 
     def __init__(self, url: str, token: str):
         self.url = url.rstrip("/") + "/api_jsonrpc.php"
-        self.token = token
+        self.token = token.strip()
         self.request_id = 0
 
     def _call(self, method: str, params: dict = None, use_auth: bool = True) -> Any:
@@ -591,7 +593,12 @@ class ExcelReportGenerator:
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file."""
     with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+    connection = config.get("zabbix", {})
+    if connection.get("token_file"):
+        token_path = Path(config_path).parent / connection["token_file"]
+        connection["token"] = token_path.read_text().strip() if token_path.exists() else ""
+    return config
 
 
 def main():
@@ -648,6 +655,7 @@ Examples:
         sys.exit(1)
 
     config = load_config(config_path)
+    validate_config(config)
 
     # Initialize Zabbix API
     zabbix = ZabbixAPI(config["zabbix"]["url"], config["zabbix"]["token"])
@@ -655,6 +663,7 @@ Examples:
     # Test connection
     try:
         api_version = zabbix._call("apiinfo.version", use_auth=False)
+        zabbix._call("hostgroup.get", {"output": ["groupid"], "limit": 1})
         print(f"Connected to Zabbix API version: {api_version}")
     except Exception as e:
         print(f"Error connecting to Zabbix: {e}")
@@ -800,7 +809,13 @@ Examples:
             else:  # month
                 device_sla = avail_2_to_30["availability"]
 
+            links = collect_link_report(zabbix, host_id,
+                int(availability_periods["prev_month"][0].timestamp()),
+                int(availability_periods["prev_month"][1].timestamp()), config)
             host_data = {
+                "link_usage": links["latest"],
+                "link_history": links["monthly"],
+                "link_daily": links["daily"],
                 "name": host_name,
                 "host": host_technical,
                 "avail_1_day": avail_1_day["availability"],
@@ -868,6 +883,7 @@ Examples:
             # Create separate report for this group
             report = ExcelReportGenerator(sla_threshold, orange_threshold)
             report.create_sheet(group_name, host_data_list, sla_threshold)
+            add_usage_sheet(report, group_name, host_data_list)
             report.add_summary_sheet([summary])
 
             # Generate filename for this group
@@ -885,6 +901,7 @@ Examples:
             combined_report.sla_threshold = sla_threshold
             combined_report.orange_threshold = orange_threshold
             combined_report.create_sheet(group_name, host_data_list, sla_threshold)
+            add_usage_sheet(combined_report, group_name, host_data_list)
 
     # Save combined report if in combined mode
     if report_mode == "combined" and combined_report:

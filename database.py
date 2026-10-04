@@ -7,6 +7,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,13 @@ def init_db():
                 display_name TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS browser_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS browser_sessions_user ON browser_sessions(user_id);
 
             CREATE TABLE IF NOT EXISTS report_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +158,8 @@ def update_user(user_id: int, display_name: str = None, role: str = None, passwo
     values.append(user_id)
     with get_db() as conn:
         conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", values)
+        if password is not None or role is not None:
+            conn.execute("DELETE FROM browser_sessions WHERE user_id = ?", (user_id,))
         return True
 
 
@@ -172,6 +182,7 @@ def change_password(user_id: int, old_password: str, new_password: str) -> bool:
             "UPDATE users SET password_hash = ?, salt = ? WHERE id = ?",
             (pw_hash, salt, user_id),
         )
+        conn.execute("DELETE FROM browser_sessions WHERE user_id = ?", (user_id,))
         return True
 
 
@@ -258,3 +269,58 @@ def get_report_count() -> int:
     with get_db() as conn:
         row = conn.execute("SELECT COUNT(*) as cnt FROM report_history").fetchone()
         return row["cnt"]
+
+
+def update_report_data(report_id: int, summary_data: list[dict], detail_data: dict) -> bool:
+    """Refresh retained measurements without changing the report or generation date."""
+    with get_db() as conn:
+        cursor = conn.execute(
+            "UPDATE report_history SET summary_data = ?, detail_data = ? WHERE id = ?",
+            (json.dumps(summary_data), json.dumps(detail_data), report_id),
+        )
+        return cursor.rowcount > 0
+
+
+def get_retained_trend_data() -> list[dict]:
+    """Read retained measurements without loading Excel blobs."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, summary_data, detail_data FROM report_history ORDER BY generated_at DESC, id DESC"
+        ).fetchall()
+        return [{"id": row["id"], "summary_data": json.loads(row["summary_data"] or "[]"),
+                 "detail_data": json.loads(row["detail_data"] or "{}")} for row in rows]
+
+
+# --- Persistent browser sessions ---
+
+def create_browser_session(user_id: int, days: int = 7) -> str:
+    if type(days) is not int or not 1 <= days <= 90:
+        raise ValueError("auth.remember_days must be an integer from 1 to 90")
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = int(time.time())
+    with get_db() as conn:
+        conn.execute("DELETE FROM browser_sessions WHERE expires_at <= ?", (now,))
+        conn.execute("INSERT INTO browser_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                     (token_hash, user_id, now + days * 86400))
+    return token
+
+
+def get_browser_session(token: str) -> dict | None:
+    if not isinstance(token, str) or len(token) != 43:
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT u.id, u.username, u.role, u.display_name FROM browser_sessions s "
+            "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?",
+            (token_hash, int(time.time())),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def revoke_browser_session(token: str):
+    if isinstance(token, str):
+        with get_db() as conn:
+            conn.execute("DELETE FROM browser_sessions WHERE token_hash = ?",
+                         (hashlib.sha256(token.encode()).hexdigest(),))

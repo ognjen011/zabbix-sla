@@ -1,8 +1,11 @@
 # Zabbix SLA Report Configuration
 
 zabbix:
-  url: "zabbixurl"
-  token: "TOKEN for API"
+  url: ""
+  token: ""
+  # Optional local token file, resolved relative to this config.
+  # Keep credentials in an ignored file such as .zabbix-api-token.
+  token_file: ""
 
 # Default SLA settings (used if group doesn't have its own)
 default_sla_threshold: 99.9
@@ -22,7 +25,7 @@ report_mode: "separate"
 #     excluded_hosts: []     (optional, hosts to exclude for this group only)
 
 host_groups:
-  host_group1:
+  "Example Group":
     sla_threshold: 99.99
     orange_threshold: 5.0
     excluded_hosts: []
@@ -51,9 +54,28 @@ global_excluded_hosts:
   # - "test-server-01"
   # - "maintenance-device"
 
+
+# Automatically retain generated reports and their trend data in local report history.
+auto_save_reports: true
+
 # Output settings
 output:
   filename_prefix: "SLA_Report"
   include_timestamp: true
   # Output directory (optional, defaults to current directory)
   # output_dir: "/path/to/reports"
+
+# Monthly usage for interfaces whose configured description matches this regex.
+# Matching is case-insensitive. Change this to your own naming convention.
+link_usage:
+  enabled: true
+  description_regex: 'EXAMPLE_LINK_DESCRIPTION'
+  # Trend window: 3 = last quarter, 6 = last six months, 12 = last year.
+  # Complete calendar months to compare (1–12).
+  history_months: 3
+  # Suppress growth percentages if either month has less hourly coverage.
+  growth_min_coverage_pct: 90
+
+# Keep browser logins across refreshes and restarts (1–90 days).
+auth:
+  remember_days: 7
