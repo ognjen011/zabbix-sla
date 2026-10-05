@@ -48,5 +48,21 @@ class SLATrendTests(unittest.TestCase):
         self.assertEqual(len(selected['detail_data']['Example Group'][0]['link_history']), 1)
 
 
+    def test_different_sla_rules_do_not_mix_but_traffic_still_combines(self):
+        selected = {'summary_data':[{'group_name':'Example', 'sla_history':[]}],
+                    'detail_data':{'Example':[{'host':'example','sla_history':[]}]}}
+        policy = {'business_hours':{'enabled':True}}
+        historic = {'summary_data':[{'group_name':'Example','sla_policy':policy,
+                     'sla_history':[{'Month':'2026-09','Availability (%)':99}]}],
+                    'detail_data':{'Example':[{'host':'example','sla_policy':policy,
+                     'sla_history':[{'Month':'2026-09','Availability (%)':99}],
+                     'link_history':[{'Month':'2026-09','Interface ID':'1','Download (GB)':10}]}]}}
+        result = combine_retained_trends(selected, [historic], 3, datetime(2026,10,4))
+        self.assertEqual(result['summary_data'][0]['sla_history'], [])
+        host = result['detail_data']['Example'][0]
+        self.assertEqual(host['sla_history'], [])
+        self.assertEqual(len(host['link_history']), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

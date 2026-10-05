@@ -363,3 +363,41 @@ this update. Cookies are local to the browser and hostname you use; private
 browsing or clearing cookies requires signing in again. The local cookie component
 uses SameSite=Lax and Secure when served over HTTPS. Because it is written through
 JavaScript, this cookie is not HttpOnly. Existing report data is preserved.
+
+## SLA working hours and short outages
+
+SLA defaults to 24 hours a day, seven days a week. Enable business hours in
+**SLA calculation options** or in `config.yaml` to use your own working days,
+start/end times, and IANA timezone:
+
+```yaml
+sla_calculation:
+  minimum_outage_seconds: 0
+  business_hours:
+    enabled: false
+    timezone: "UTC"
+    weekdays: [0, 1, 2, 3, 4]
+    start: "09:00"
+    end: "17:00"
+```
+
+Weekdays use 0 for Monday through 6 for Sunday. Set `enabled: true` to activate
+the schedule. Overnight shifts are supported; the weekday is the day the shift
+starts. Timezone daylight-saving changes are reflected in elapsed hours. Both
+the SLA denominator and counted downtime are restricted to working hours; a
+period with no working hours displays N/A. Traffic reports still cover full days.
+
+For company-specific hours, place a `sla_calculation.business_hours` block under
+the company's `host_groups` entry, or use **Company working-hours overrides**.
+Group settings override the global settings. Without an enabled global or group
+schedule, SLA remains 24/7.
+
+Set **Ignore outages shorter than (seconds)** to any non-negative whole number,
+or configure `minimum_outage_seconds` directly. For example, 30 ignores outages
+shorter than 30 seconds; 120 ignores outages shorter than two minutes. Zero
+(the default) counts all outages. Outages equal to the chosen threshold count. Full outage durations are checked before clipping to reporting or working
+hours. Overlapping downtime intervals are consolidated to avoid counting the
+same downtime twice. These options apply to current reports and monthly SLA
+trends. Saved SLA trends combine only snapshots with matching calculation rules;
+traffic trends remain independent of those rules. They do not implement
+maintenance exclusions or billing rules.

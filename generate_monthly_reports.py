@@ -6,6 +6,7 @@ from pathlib import Path
 
 from openpyxl.chart import LineChart, Reference
 
+from sla_policy import resolve_policy
 from report_retention import retain_monthly_workbook
 
 from link_usage import calendar_months, collect_link_report, add_usage_sheet, validate_config
@@ -50,6 +51,7 @@ def generate_reports(api, config, months, output_dir):
     for group in groups:
         name = group['name']
         group_config = groups_config[name] or {}
+        api.sla_policy = resolve_policy(config.get('sla_calculation', {}), group_config.get('sla_calculation', {}))
         target = group_config.get('sla_threshold', config.get('default_sla_threshold', 99.9))
         warning = group_config.get('orange_threshold', config.get('default_orange_threshold', 5))
         excluded = {host.lower() for host in (config.get('global_excluded_hosts') or []) + (group_config.get('excluded_hosts') or [])}
@@ -67,7 +69,7 @@ def generate_reports(api, config, months, output_dir):
                 sla = stats['availability']
                 availability.append({'name':host['name'], 'host':host['host'],
                     'month':datetime.fromtimestamp(start).strftime('%Y-%m'), 'device_sla':sla,
-                    'sla_target':target, 'sla_status':'COMPLIANT' if sla >= target else 'WARNING' if sla >= target - warning else 'BREACH',
+                    'sla_target':target, 'sla_status':'N/A' if sla is None else 'COMPLIANT' if sla >= target else 'WARNING' if sla >= target - warning else 'BREACH',
                     'downtime_seconds':stats['downtime_seconds'], 'total_seconds':stats['total_seconds']})
             all_hosts.append({**host, 'link_usage':links['latest'], 'link_history':links['monthly'], 'link_daily':links['daily'], 'availability':availability})
         safe_name = ''.join(character if character.isalnum() or character in '-_' else '_' for character in name)
@@ -78,7 +80,7 @@ def generate_reports(api, config, months, output_dir):
             sheet = add_availability_sheet(report, name, sla_rows)
             seconds = sum(row['total_seconds'] for row in sla_rows)
             downtime = sum(row['downtime_seconds'] for row in sla_rows)
-            overall = (1 - downtime / seconds) * 100 if seconds else 100
+            overall = (1 - downtime / seconds) * 100 if seconds else None
             sheet.append(['Overall group', '', month, overall, target])
             monthly_hosts = [{**host, 'link_usage':[r for r in host['link_history'] if r['Month'] == month], 'link_history':[], 'link_daily':[r for r in host['link_daily'] if r['Date'].startswith(month)]} for host in all_hosts]
             add_usage_sheet(report, name, monthly_hosts)
@@ -87,7 +89,7 @@ def generate_reports(api, config, months, output_dir):
             files.append(path)
             if config.get("auto_save_reports", True):
                 retain_monthly_workbook(path, name)
-            print(f'Saved {path}; overall SLA {overall:.2f}%', flush=True)
+            print(f'Saved {path}; overall SLA: {overall}', flush=True)
         comparison = ExcelReportGenerator(target, warning)
         sla_rows = [row for host in all_hosts for row in host['availability']]
         add_availability_sheet(comparison, name, sla_rows)
@@ -98,7 +100,7 @@ def generate_reports(api, config, months, output_dir):
             rows = [host['availability'][month_index] for host in all_hosts]
             seconds = sum(row['total_seconds'] for row in rows)
             downtime = sum(row['downtime_seconds'] for row in rows)
-            overall = (1 - downtime / seconds) * 100 if seconds else 100
+            overall = (1 - downtime / seconds) * 100 if seconds else None
             summary.append([datetime.fromtimestamp(start).strftime('%Y-%m'), overall, target, *[sum(row['sla_status'] == status for row in rows) for status in ('COMPLIANT', 'WARNING', 'BREACH')]])
         chart = LineChart()
         chart.title = f'{name}: Monthly SLA'
@@ -123,6 +125,7 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     api = ZabbixAPI(config['zabbix']['url'], config['zabbix']['token'])
+    api.sla_policy = config.get("sla_calculation", {})
     generate_reports(api, config, args.months, args.output_dir)
 
 

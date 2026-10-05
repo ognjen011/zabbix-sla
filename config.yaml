@@ -28,6 +28,14 @@ host_groups:
   "Example Group":
     sla_threshold: 99.99
     orange_threshold: 5.0
+    # Optional company schedule; omitted schedules inherit the global setting.
+    # sla_calculation:
+    #   business_hours:
+    #     enabled: true
+    #     timezone: "UTC"
+    #     weekdays: [0, 1, 2, 3, 4]
+    #     start: "08:00"
+    #     end: "17:00"
     excluded_hosts: []
       # - "test-device-1"
 
@@ -79,3 +87,13 @@ link_usage:
 # Keep browser logins across refreshes and restarts (1–90 days).
 auth:
   remember_days: 7
+
+# SLA rules: business-hour filtering is disabled until you set your schedule.
+sla_calculation:
+  minimum_outage_seconds: 0  # Ignore outages shorter than this many seconds; 0 counts all.
+  business_hours:
+    enabled: false
+    timezone: 'UTC'
+    weekdays: [0, 1, 2, 3, 4]  # 0=Monday, 6=Sunday
+    start: '09:00'
+    end: '17:00'

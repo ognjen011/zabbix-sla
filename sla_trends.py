@@ -13,7 +13,7 @@ def collect_sla_history(api, host_id, end, months, target, warning, latest=None)
         availability = stats['availability']
         rows.append({'Month':datetime.fromtimestamp(start).strftime('%Y-%m'),
             'Availability (%)':availability, 'SLA Target (%)':target,
-            'Status':'COMPLIANT' if availability >= target else 'WARNING' if availability >= target - warning else 'BREACH',
+            'Status':'N/A' if availability is None else 'COMPLIANT' if availability >= target else 'WARNING' if availability >= target - warning else 'BREACH',
             'Downtime (seconds)':stats['downtime_seconds'], 'Total (seconds)':stats['total_seconds']})
     return rows
 

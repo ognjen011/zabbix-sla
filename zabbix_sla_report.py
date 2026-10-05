@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from sla_policy import calculate_availability, validate_policy, resolve_policy
 from link_usage import collect_link_report, add_usage_sheet, validate_config
 
 import requests
@@ -170,43 +171,15 @@ class ZabbixAPI:
             for rev in recovery_events:
                 recovery_map[rev["eventid"]] = int(rev["clock"])
 
-        # Step 5: Calculate downtime
-        total_seconds = time_till - time_from
-        downtime_seconds = 0
-
+        outages = []
         for event in all_events:
-            # Only count "Unavailable by ICMP ping" problems
-            event_name = event.get("name", "").lower()
-            if "unavailable by icmp" not in event_name:
+            if "unavailable by icmp" not in event.get("name", "").lower():
                 continue
+            recovery_id = event.get("r_eventid", "0")
+            event_end = recovery_map.get(recovery_id, time_till + 1) if recovery_id != "0" else time_till + 1
+            outages.append((int(event["clock"]), event_end))
+        return calculate_availability(time_from, time_till + 1, outages, getattr(self, "sla_policy", {}))
 
-            event_start = int(event["clock"])
-            r_eventid = event.get("r_eventid", "0")
-
-            if r_eventid and r_eventid != "0":
-                # Resolved: look up recovery time
-                event_end = recovery_map.get(r_eventid, time_till)
-            else:
-                # Still active / unresolved
-                event_end = time_till
-
-            # Clamp to the time range
-            actual_start = max(event_start, time_from)
-            actual_end = min(event_end, time_till)
-
-            if actual_end > actual_start:
-                downtime_seconds += actual_end - actual_start
-
-        if total_seconds > 0:
-            availability = ((total_seconds - downtime_seconds) / total_seconds) * 100
-        else:
-            availability = 100.0
-
-        return {
-            "availability": round(availability, 2),
-            "downtime_seconds": downtime_seconds,
-            "total_seconds": total_seconds,
-        }
 
 
 class DateRangeCalculator:
@@ -312,6 +285,8 @@ class ExcelReportGenerator:
 
     def get_cell_style(self, value: float) -> tuple:
         """Determine cell fill and font based on value and thresholds."""
+        if value is None:
+            return PatternFill(), Font(color="666666")
         if value >= self.sla_threshold:
             return self.green_fill, self.green_font
         elif value >= self.sla_threshold - self.orange_threshold:
@@ -383,7 +358,10 @@ class ExcelReportGenerator:
 
             # SLA Status
             device_sla = host_data.get("device_sla", 100.0)
-            if device_sla >= self.sla_threshold:
+            if device_sla is None:
+                status = "N/A"
+                fill, font = self.get_cell_style(None)
+            elif device_sla >= self.sla_threshold:
                 status = "COMPLIANT"
                 fill, font = self.green_fill, self.green_font
             elif device_sla >= self.sla_threshold - self.orange_threshold:
@@ -412,9 +390,9 @@ class ExcelReportGenerator:
             total_possible_7_days = sum(h.get("total_7_days", 604800) for h in data)
             total_possible_prev_month = sum(h.get("total_prev_month", 2592000) for h in data)
 
-            overall_1_day = ((total_possible_1_day - total_downtime_1_day) / total_possible_1_day * 100) if total_possible_1_day > 0 else 100.0
-            overall_7_days = ((total_possible_7_days - total_downtime_7_days) / total_possible_7_days * 100) if total_possible_7_days > 0 else 100.0
-            overall_prev_month = ((total_possible_prev_month - total_downtime_prev_month) / total_possible_prev_month * 100) if total_possible_prev_month > 0 else 100.0
+            overall_1_day = ((total_possible_1_day - total_downtime_1_day) / total_possible_1_day * 100) if total_possible_1_day > 0 else None
+            overall_7_days = ((total_possible_7_days - total_downtime_7_days) / total_possible_7_days * 100) if total_possible_7_days > 0 else None
+            overall_prev_month = ((total_possible_prev_month - total_downtime_prev_month) / total_possible_prev_month * 100) if total_possible_prev_month > 0 else None
             overall_sla = overall_prev_month  # Use prev month for device sheet overall
 
             # Overall label
@@ -432,7 +410,7 @@ class ExcelReportGenerator:
             ]
 
             for value, col in overall_cols:
-                cell = ws.cell(row=overall_row, column=col, value=round(value, 2))
+                cell = ws.cell(row=overall_row, column=col, value=round(value, 2) if value is not None else None)
                 cell.number_format = "0.00"
                 fill, font = self.get_cell_style(value)
                 cell.fill = fill
@@ -448,7 +426,10 @@ class ExcelReportGenerator:
             cell.alignment = self.center_align
 
             # Overall status
-            if overall_sla >= self.sla_threshold:
+            if overall_sla is None:
+                status = "N/A"
+                fill, font_style = self.get_cell_style(None)
+            elif overall_sla >= self.sla_threshold:
                 status = "COMPLIANT"
                 fill, font_style = self.green_fill, self.green_font
             elif overall_sla >= self.sla_threshold - self.orange_threshold:
@@ -550,7 +531,9 @@ class ExcelReportGenerator:
                 cell = ws.cell(row=row_idx, column=col, value=value)
                 cell.number_format = "0.00"
                 # Use group-specific SLA threshold for color coding
-                if value >= group_sla_target:
+                if value is None:
+                    fill, font = self.get_cell_style(None)
+                elif value >= group_sla_target:
                     fill, font = self.green_fill, self.green_font
                 elif value >= group_sla_target - self.orange_threshold:
                     fill, font = self.orange_fill, self.orange_font
@@ -563,7 +546,10 @@ class ExcelReportGenerator:
 
             # SLA Status (use group-specific threshold)
             overall_sla = summary.get("overall_sla", 100.0)
-            if overall_sla >= group_sla_target:
+            if overall_sla is None:
+                status = "N/A"
+                fill, font = self.get_cell_style(None)
+            elif overall_sla >= group_sla_target:
                 status = "COMPLIANT"
                 fill, font = self.green_fill, self.green_font
             elif overall_sla >= group_sla_target - self.orange_threshold:
@@ -656,9 +642,11 @@ Examples:
 
     config = load_config(config_path)
     validate_config(config)
+    validate_policy(config.get("sla_calculation", {}))
 
     # Initialize Zabbix API
     zabbix = ZabbixAPI(config["zabbix"]["url"], config["zabbix"]["token"])
+    zabbix.sla_policy = config.get("sla_calculation", {})
 
     # Test connection
     try:
@@ -740,6 +728,7 @@ Examples:
 
         # Get group-specific config
         group_config = host_groups_config.get(group_name, {})
+        zabbix.sla_policy = resolve_policy(config.get("sla_calculation", {}), group_config.get("sla_calculation", {}))
         sla_threshold = group_config.get("sla_threshold", default_sla)
         orange_threshold = group_config.get("orange_threshold", default_orange)
         group_excluded = group_config.get("excluded_hosts", []) or []
@@ -835,7 +824,9 @@ Examples:
 
             # Update summary counts
             summary["total"] += 1
-            if device_sla >= sla_threshold:
+            if device_sla is None:
+                pass
+            elif device_sla >= sla_threshold:
                 summary["compliant"] += 1
             elif device_sla >= sla_threshold - orange_threshold:
                 summary["warning"] += 1
@@ -855,9 +846,9 @@ Examples:
             total_possible_prev_month = sum(h["total_prev_month"] for h in host_data_list)
 
             # Calculate overall SLA based on total time
-            overall_1_day = ((total_possible_1_day - total_downtime_1_day) / total_possible_1_day * 100) if total_possible_1_day > 0 else 100.0
-            overall_7_days = ((total_possible_7_days - total_downtime_7_days) / total_possible_7_days * 100) if total_possible_7_days > 0 else 100.0
-            overall_prev_month = ((total_possible_prev_month - total_downtime_prev_month) / total_possible_prev_month * 100) if total_possible_prev_month > 0 else 100.0
+            overall_1_day = ((total_possible_1_day - total_downtime_1_day) / total_possible_1_day * 100) if total_possible_1_day > 0 else None
+            overall_7_days = ((total_possible_7_days - total_downtime_7_days) / total_possible_7_days * 100) if total_possible_7_days > 0 else None
+            overall_prev_month = ((total_possible_prev_month - total_downtime_prev_month) / total_possible_prev_month * 100) if total_possible_prev_month > 0 else None
 
             # Overall SLA based on selected period
             if args.period == "day":
@@ -867,10 +858,10 @@ Examples:
             else:
                 overall_sla = overall_prev_month
 
-            summary["overall_sla"] = round(overall_sla, 2)
-            summary["overall_1_day"] = round(overall_1_day, 2)
-            summary["overall_7_days"] = round(overall_7_days, 2)
-            summary["overall_prev_month"] = round(overall_prev_month, 2)
+            summary["overall_sla"] = round(overall_sla, 2) if overall_sla is not None else None
+            summary["overall_1_day"] = round(overall_1_day, 2) if overall_1_day is not None else None
+            summary["overall_7_days"] = round(overall_7_days, 2) if overall_7_days is not None else None
+            summary["overall_prev_month"] = round(overall_prev_month, 2) if overall_prev_month is not None else None
         else:
             summary["overall_sla"] = 100.0
             summary["overall_1_day"] = 100.0

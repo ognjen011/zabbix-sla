@@ -9,7 +9,7 @@ Default login: admin / admin
 
 import io
 import time
-from datetime import datetime
+from datetime import datetime, time as clock_time
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +17,7 @@ import streamlit as st
 
 from retained_trends import combine_retained_trends
 from report_visuals import show_sla_gauges, show_link_trends, show_sla_trends
+from sla_policy import validate_policy, resolve_policy
 from sla_trends import collect_sla_history, group_sla_history
 from link_usage import collect_link_report, usage_rows, add_usage_sheet, validate_config
 
@@ -314,6 +315,30 @@ if page == "Generate Report":
             index=0 if default_config.get("report_mode", "combined") == "combined" else 1,
         )
 
+    with st.expander("SLA calculation options", expanded=False):
+        calculation_defaults = default_config.get("sla_calculation", {}) or {}
+        business_defaults = calculation_defaults.get("business_hours", {}) or {}
+        minimum_outage = st.number_input("Ignore outages shorter than (seconds)",
+            min_value=0, value=int(calculation_defaults.get("minimum_outage_seconds", 0)), step=1,
+            help="0 counts all outages. An outage equal to this duration still counts.")
+        business_only = st.checkbox("Business-hours-only SLA", value=business_defaults.get("enabled", False))
+        timezone = st.text_input("Business-hours timezone", value=business_defaults.get("timezone", "UTC"), disabled=not business_only)
+        business_days = st.multiselect("Business weekdays", list(range(7)),
+            default=business_defaults.get("weekdays", [0, 1, 2, 3, 4]),
+            format_func=lambda day: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][day], disabled=not business_only)
+        try:
+            business_start = clock_time.fromisoformat(business_defaults.get("start", "09:00"))
+            business_end = clock_time.fromisoformat(business_defaults.get("end", "17:00"))
+        except ValueError:
+            st.error("Invalid business-hours times in config.yaml; use HH:MM.")
+            st.stop()
+        business_start = st.time_input("Business day starts", value=business_start, disabled=not business_only)
+        business_end = st.time_input("Business day ends", value=business_end, disabled=not business_only)
+        sla_policy = {"minimum_outage_seconds":minimum_outage, "business_hours":{
+            "enabled":business_only, "timezone":timezone, "weekdays":business_days,
+            "start":business_start.strftime("%H:%M"), "end":business_end.strftime("%H:%M")}}
+        st.caption("Overnight shifts are supported; weekdays identify the shift start day. Outages equal to the configured minimum duration are counted. Business hours restrict both downtime and eligible SLA time. Periods with no eligible hours have no SLA value. Traffic measurements still cover the entire day.")
+
     # --- Host group selection ---
     st.subheader("Host Groups")
     config_groups = list((default_config.get("host_groups", {}) or {}).keys())
@@ -402,6 +427,31 @@ if page == "Generate Report":
                         key=f"orange_{g}", label_visibility="collapsed",
                     )
 
+    if selected_groups:
+        with st.expander("Company working-hours overrides", expanded=False):
+            for group in selected_groups:
+                configured_group = (default_config.get("host_groups", {}) or {}).get(group, {}) or {}
+                override = (configured_group.get("sla_calculation", {}) or {}).get("business_hours", {}) or {}
+                custom = st.checkbox(f"Custom working hours for {group}", value=bool(override.get("enabled", False)), key=f"custom_hours_{group}")
+                group_business = {**sla_policy["business_hours"], **override}
+                if custom:
+                    group_days = st.multiselect(f"Working days ({group})", list(range(7)), default=group_business["weekdays"],
+                        format_func=lambda day: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][day], key=f"hours_days_{group}")
+                    group_timezone = st.text_input(f"Timezone ({group})", value=group_business["timezone"], key=f"hours_zone_{group}")
+                    try:
+                        start = clock_time.fromisoformat(group_business["start"])
+                        end = clock_time.fromisoformat(group_business["end"])
+                    except ValueError:
+                        st.error(f"Invalid configured working-hours times for {group}.")
+                        st.stop()
+                    start = st.time_input(f"Start ({group})", value=start, key=f"hours_start_{group}")
+                    end = st.time_input(f"End ({group})", value=end, key=f"hours_end_{group}")
+                    group_business = {"enabled":True, "weekdays":group_days, "timezone":group_timezone,
+                        "start":start.strftime("%H:%M"), "end":end.strftime("%H:%M")}
+                else:
+                    group_business = sla_policy["business_hours"]
+                selected_groups[group]["sla_calculation"] = {**sla_policy, "business_hours":group_business}
+
     # Excluded hosts
     global_excluded_str = st.text_area(
         "Global Excluded Hosts (one per line)",
@@ -435,6 +485,8 @@ if page == "Generate Report":
 
         try:
             validate_config(default_config)
+            validate_policy(sla_policy)
+            api.sla_policy = sla_policy
         except (ValueError, TypeError) as exc:
             st.error(f"Invalid link usage configuration: {exc}")
             st.stop()
@@ -479,6 +531,11 @@ if page == "Generate Report":
             group_name = group["name"]
             group_id = group["groupid"]
             gc = selected_groups.get(group_name, {})
+            try:
+                api.sla_policy = resolve_policy(sla_policy, gc.get("sla_calculation", {}))
+            except ValueError as exc:
+                st.error(f"Invalid SLA rules for {group_name}: {exc}")
+                st.stop()
             grp_sla = gc.get("sla_threshold", sla_threshold)
             grp_orange = gc.get("orange_threshold", orange_threshold)
             grp_excluded = gc.get("excluded_hosts", []) or []
@@ -528,7 +585,9 @@ if page == "Generate Report":
                 else:
                     device_sla = avail_prev_month["availability"]
 
-                if device_sla >= grp_sla:
+                if device_sla is None:
+                    status = "N/A"
+                elif device_sla >= grp_sla:
                     status = "COMPLIANT"
                     summary["compliant"] += 1
                 elif device_sla >= grp_sla - grp_orange:
@@ -556,6 +615,7 @@ if page == "Generate Report":
                     st.error(f"Cannot collect monthly SLA history for {host_name}: {exc}")
                     st.stop()
                 host_data_list.append({
+                    "sla_policy": api.sla_policy,
                     "sla_history": monthly_sla,
                     "link_usage": links["latest"],
                     "link_history": links["monthly"],
@@ -583,15 +643,15 @@ if page == "Generate Report":
                 tp7 = sum(h["total_7_days"] for h in host_data_list)
                 tpm = sum(h["total_prev_month"] for h in host_data_list)
 
-                o1 = ((tp1 - td1) / tp1 * 100) if tp1 > 0 else 100.0
-                o7 = ((tp7 - td7) / tp7 * 100) if tp7 > 0 else 100.0
-                om = ((tpm - tdm) / tpm * 100) if tpm > 0 else 100.0
+                o1 = ((tp1 - td1) / tp1 * 100) if tp1 > 0 else None
+                o7 = ((tp7 - td7) / tp7 * 100) if tp7 > 0 else None
+                om = ((tpm - tdm) / tpm * 100) if tpm > 0 else None
                 overall_sla = {"day": o1, "week": o7, "month": om}[period]
                 summary.update({
-                    "overall_1_day": round(o1, 2),
-                    "overall_7_days": round(o7, 2),
-                    "overall_prev_month": round(om, 2),
-                    "overall_sla": round(overall_sla, 2),
+                    "overall_1_day": round(o1, 2) if o1 is not None else None,
+                    "overall_7_days": round(o7, 2) if o7 is not None else None,
+                    "overall_prev_month": round(om, 2) if om is not None else None,
+                    "overall_sla": round(overall_sla, 2) if overall_sla is not None else None,
                 })
             else:
                 summary.update({
@@ -599,6 +659,7 @@ if page == "Generate Report":
                     "overall_prev_month": 100.0, "overall_sla": 100.0,
                 })
 
+            summary["sla_policy"] = api.sla_policy
             summary["sla_history"] = group_sla_history(host_data_list, grp_sla)
             all_group_summaries.append(summary)
             all_group_data[group_name] = host_data_list
@@ -617,6 +678,7 @@ if page == "Generate Report":
         detail_for_storage = {}
         for gn, hlist in all_group_data.items():
             detail_for_storage[gn] = [{
+                "sla_policy": h.get("sla_policy", {}),
                 "sla_history": h.get("sla_history", []),
                 "link_usage": h.get("link_usage", []),
                 "link_history": h.get("link_history", []),
@@ -637,6 +699,7 @@ if page == "Generate Report":
             "orange_threshold": orange_threshold,
             "period": period,
             "trend_months": trend_months,
+            "sla_policy": sla_policy,
             "excel_files": excel_files,
             "detail_for_storage": detail_for_storage,
             "total_host_count": sum(s["total"] for s in all_group_summaries),
@@ -669,6 +732,8 @@ if page == "Generate Report":
         st.caption(f"This report contains {rpt_data.get('trend_months', 'unknown')} months of trend history.")
         st.success(f"Report generated for {total_host_count} hosts across {len(all_group_summaries)} groups.")
 
+        if rpt_data.get("sla_policy"):
+            st.caption(f"SLA calculation policy: {rpt_data['sla_policy']}")
         show_sla_gauges(all_group_summaries, r_selected_groups, r_orange, r_period)
 
         # Summary table
@@ -700,7 +765,7 @@ if page == "Generate Report":
             return styles
 
         styled_summary = summary_df.style.apply(style_summary, axis=1).format(
-            {c: "{:.2f}" for c in sla_cols + ["SLA Target (%)"]},
+            {c: "{:.2f}" for c in sla_cols + ["SLA Target (%)"]}, na_rep="N/A",
         )
         st.dataframe(styled_summary, use_container_width=True, hide_index=True)
 
@@ -740,7 +805,7 @@ if page == "Generate Report":
                 return styles
 
             styled_df = df.style.apply(style_group_row, axis=1).format(
-                {c: "{:.2f}" for c in avail_cols + ["SLA Target (%)"]},
+                {c: "{:.2f}" for c in avail_cols + ["SLA Target (%)"]}, na_rep="N/A",
             )
             st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
@@ -835,7 +900,7 @@ elif page == "Report History":
                                 return styles
 
                             styled = sdf.style.apply(style_hist_row, axis=1).format(
-                                {"SLA Target (%)": "{:.2f}", "Overall SLA (%)": "{:.2f}"},
+                                {"SLA Target (%)": "{:.2f}", "Overall SLA (%)": "{:.2f}"}, na_rep="N/A",
                             )
                             st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -871,7 +936,7 @@ elif page == "Report History":
                         for gn, hlist in full_report["detail_data"].items():
                             st.markdown(f"**{gn}**")
                             if hlist:
-                                hdf = pd.DataFrame([{k: v for k, v in host.items() if k not in ("link_usage", "link_history", "link_daily", "sla_history")} for host in hlist])
+                                hdf = pd.DataFrame([{k: v for k, v in host.items() if k not in ("link_usage", "link_history", "link_daily", "sla_history", "sla_policy")} for host in hlist])
                                 st.dataframe(hdf, use_container_width=True, hide_index=True)
                         st.caption(f"Trend charts combine retained reports for the last {trend_report['trend_months']} complete calendar months. Snapshot tables describe this report's month; gauges and trend charts show the configured history window.")
                         show_sla_trends(trend_report["summary_data"], trend_report["detail_data"], key_prefix=f"history_{rpt['id']}_")
